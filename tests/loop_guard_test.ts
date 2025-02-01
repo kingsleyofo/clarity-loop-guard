@@ -68,6 +68,57 @@ Clarinet.test({
 });
 
 Clarinet.test({
+    name: "Test node group creation and management",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const wallet1 = accounts.get('wallet_1')!;
+        
+        // Create node group
+        let groupBlock = chain.mineBlock([
+            Tx.contractCall('loop-guard', 'create-node-group', [
+                types.ascii("test-group"),
+                types.ascii("Test group description"),
+                types.bool(true),
+                types.uint(100)
+            ], deployer.address)
+        ]);
+        
+        groupBlock.receipts[0].result.expectOk();
+        const groupId = groupBlock.receipts[0].result.expectOk();
+        
+        // Register node
+        let registerBlock = chain.mineBlock([
+            Tx.contractCall('loop-guard', 'register-node', [
+                types.principal(wallet1.address)
+            ], deployer.address)
+        ]);
+        
+        registerBlock.receipts[0].result.expectOk();
+        
+        // Add node to group
+        let addToGroupBlock = chain.mineBlock([
+            Tx.contractCall('loop-guard', 'add-node-to-group', [
+                types.principal(wallet1.address),
+                types.uint(0)
+            ], deployer.address)
+        ]);
+        
+        addToGroupBlock.receipts[0].result.expectOk();
+        
+        // Check group info
+        let groupInfoBlock = chain.mineBlock([
+            Tx.contractCall('loop-guard', 'get-group-info', [
+                types.uint(0)
+            ], deployer.address)
+        ]);
+        
+        const groupInfo = groupInfoBlock.receipts[0].result.expectOk().expectSome();
+        assertEquals(groupInfo['name'], "test-group");
+        assertEquals(groupInfo['members'].length, 1);
+    }
+});
+
+Clarinet.test({
     name: "Test node revocation",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
