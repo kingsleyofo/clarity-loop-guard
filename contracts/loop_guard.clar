@@ -6,9 +6,12 @@
 (define-constant err-not-registered (err u101))
 (define-constant err-already-registered (err u102))
 (define-constant err-revoked (err u103))
+(define-constant err-group-not-found (err u104))
+(define-constant err-already-in-group (err u105))
 
 ;; Data Variables 
 (define-data-var total-nodes uint u0)
+(define-data-var total-groups uint u0)
 
 ;; Data Maps
 (define-map nodes 
@@ -18,7 +21,8 @@
         active: bool,
         permissions: (list 10 uint),
         last-active: uint,
-        status: (string-ascii 20)
+        status: (string-ascii 20),
+        group-id: (optional uint)
     }
 )
 
@@ -28,6 +32,20 @@
         timestamp: uint,
         action: (string-ascii 20)
     })
+)
+
+(define-map node-groups
+    uint 
+    {
+        name: (string-ascii 20),
+        description: (string-ascii 50),
+        members: (list 100 principal),
+        created-at: uint,
+        settings: {
+            auto-revoke: bool,
+            inactivity-threshold: uint
+        }
+    }
 )
 
 ;; Private Functions
@@ -68,12 +86,62 @@
             active: true,
             permissions: (list),
             last-active: block-height,
-            status: "active"
+            status: "active",
+            group-id: none
         })
         
         (var-set total-nodes (+ (var-get total-nodes) u1))
         (log-activity node "registered")
         (ok true)
+    )
+)
+
+(define-public (create-node-group 
+    (name (string-ascii 20))
+    (description (string-ascii 50))
+    (auto-revoke bool)
+    (inactivity-threshold uint)
+)
+    (let ((group-id (var-get total-groups)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            
+            (map-set node-groups group-id {
+                name: name,
+                description: description,
+                members: (list),
+                created-at: block-height,
+                settings: {
+                    auto-revoke: auto-revoke,
+                    inactivity-threshold: inactivity-threshold
+                }
+            })
+            
+            (var-set total-groups (+ group-id u1))
+            (ok group-id)
+        )
+    )
+)
+
+(define-public (add-node-to-group (node principal) (group-id uint))
+    (let ((node-data (unwrap! (map-get? nodes node) err-not-registered))
+          (group-data (unwrap! (map-get? node-groups group-id) err-group-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (asserts! (is-none (get group-id node-data)) err-already-in-group)
+            
+            (map-set nodes node (merge node-data { group-id: (some group-id) }))
+            (map-set node-groups group-id 
+                (merge group-data {
+                    members: (unwrap-panic (as-max-len? 
+                        (append (get members group-data) node)
+                        u100
+                    ))
+                })
+            )
+            (log-activity node (concat "added-to-group-" (to-string group-id)))
+            (ok true)
+        )
     )
 )
 
@@ -90,7 +158,8 @@
                         active: true,
                         permissions: (list),
                         last-active: u0,
-                        status: "active"
+                        status: "active",
+                        group-id: none
                     }
                     (map-get? nodes node)
                 )
@@ -118,7 +187,8 @@
                         active: true,
                         permissions: (list),
                         last-active: u0,
-                        status: "active"
+                        status: "active",
+                        group-id: none
                     }
                     (map-get? nodes node)
                 )
@@ -144,4 +214,12 @@
 
 (define-read-only (get-total-nodes)
     (ok (var-get total-nodes))
+)
+
+(define-read-only (get-group-info (group-id uint))
+    (ok (map-get? node-groups group-id))
+)
+
+(define-read-only (get-total-groups)
+    (ok (var-get total-groups))
 )
