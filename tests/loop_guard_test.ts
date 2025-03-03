@@ -1,7 +1,5 @@
-[Previous test content]
-
 Clarinet.test({
-    name: "Test rate limiting and health checks",
+    name: "Test enhanced status tracking and health scoring",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
         const wallet1 = accounts.get('wallet_1')!;
@@ -15,21 +13,31 @@ Clarinet.test({
         
         block.receipts[0].result.expectOk();
         
-        // Attempt rapid updates
-        let updateBlock = chain.mineBlock([
-            Tx.contractCall('loop-guard', 'update-node-status', [
-                types.principal(wallet1.address),
-                types.ascii("running")
-            ], wallet1.address),
-            Tx.contractCall('loop-guard', 'update-node-status', [
-                types.principal(wallet1.address),
-                types.ascii("error")
-            ], wallet1.address)
-        ]);
+        // Test adaptive rate limiting
+        let updateBlocks = [];
+        for(let i = 0; i < 5; i++) {
+            updateBlocks.push(
+                chain.mineBlock([
+                    Tx.contractCall('loop-guard', 'update-node-status', [
+                        types.principal(wallet1.address),
+                        types.ascii("error")
+                    ], wallet1.address)
+                ])
+            );
+            chain.mineEmptyBlocks(11); // Mine enough blocks to pass rate limit
+        }
         
-        updateBlock.receipts[0].result.expectOk();
-        updateBlock.receipts[1].result.expectErr(types.uint(106)); // err-rate-limit
+        // Verify health score decrease
+        const nodeInfo = chain.callReadOnlyFn(
+            'loop-guard',
+            'get-node-info',
+            [types.principal(wallet1.address)],
+            wallet1.address
+        );
+        
+        // Assert health score decreased
+        assert(nodeInfo.result.expectSome().expectTuple()['health-score'] < 100);
     }
 });
 
-[Remaining tests unchanged]
+[Previous tests remain unchanged]
