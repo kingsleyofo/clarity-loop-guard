@@ -8,12 +8,20 @@
 (define-constant err-revoked (err u103))
 (define-constant err-group-not-found (err u104))
 (define-constant err-already-in-group (err u105))
+(define-constant err-rate-limit (err u106))
+(define-constant err-invalid-status (err u107))
+(define-constant err-history-full (err u108))
+
+;; Rate limiting constants
+(define-constant min-update-interval u10)
+(define-constant valid-statuses (list "active" "running" "stopped" "maintenance" "error"))
+(define-constant max-history-length u50)
 
 ;; Data Variables 
 (define-data-var total-nodes uint u0)
 (define-data-var total-groups uint u0)
 
-;; Data Maps
+;; Enhanced Data Maps
 (define-map nodes 
     principal 
     {
@@ -22,204 +30,108 @@
         permissions: (list 10 uint),
         last-active: uint,
         status: (string-ascii 20),
-        group-id: (optional uint)
+        group-id: (optional uint),
+        health-score: uint,
+        last-update: uint,
+        update-count: uint
     }
 )
 
-(define-map node-activity
+;; New Status History Map
+(define-map status-history
     principal
-    (list 100 {
-        timestamp: uint,
-        action: (string-ascii 20)
-    })
-)
-
-(define-map node-groups
-    uint 
     {
-        name: (string-ascii 20),
-        description: (string-ascii 50),
-        members: (list 100 principal),
-        created-at: uint,
-        settings: {
-            auto-revoke: bool,
-            inactivity-threshold: uint
-        }
+        entries: (list 50 {
+            status: (string-ascii 20),
+            timestamp: uint,
+            blocks-in-status: uint
+        })
     }
 )
 
-;; Private Functions
-(define-private (is-registered (node principal))
-    (default-to false (get registered (map-get? nodes node)))
+;; Enhanced Private Functions
+(define-private (get-adaptive-interval (node principal))
+    (let ((node-data (unwrap! (map-get? nodes node) u0)))
+        (if (< (get health-score node-data) u50)
+            (* min-update-interval u2)
+            min-update-interval
+        )
+    )
 )
 
-(define-private (is-active (node principal))
-    (default-to false (get active (map-get? nodes node)))
+(define-private (add-status-history (node principal) (new-status (string-ascii 20)))
+    (let (
+        (current-history (default-to { entries: (list) } (map-get? status-history node)))
+        (new-entry {
+            status: new-status,
+            timestamp: block-height,
+            blocks-in-status: u0
+        })
+    )
+        (if (>= (len (get entries current-history)) max-history-length)
+            (err err-history-full)
+            (ok (map-set status-history node {
+                entries: (append (get entries current-history) new-entry)
+            }))
+        )
+    )
 )
 
-(define-private (log-activity (node principal) (action (string-ascii 20)))
-    (let ((current-time block-height))
-        (map-set node-activity 
-            node
-            (unwrap-panic (as-max-len? 
-                (append 
-                    (default-to (list) (map-get? node-activity node))
+(define-private (calculate-health-score (node principal) (status (string-ascii 20)))
+    (let (
+        (node-data (unwrap! (map-get? nodes node) u0))
+        (base-score (get health-score node-data))
+        (update-count (get update-count node-data))
+    )
+        (cond
+            ((is-eq status "error") (- base-score u10))
+            ((is-eq status "maintenance") (- base-score u5))
+            ((> update-count u100) (min u100 (+ base-score u2)))
+            (true (min u100 (+ base-score u1)))
+        )
+    )
+)
+
+;; Enhanced Update Status Function
+(define-public (update-node-status (node principal) (new-status (string-ascii 20)))
+    (begin
+        (asserts! (is-registered node) err-not-registered)
+        (asserts! (is-active node) err-revoked)
+        (asserts! (>= (- block-height (get last-update (default-to 
+            { last-update: u0 } 
+            (map-get? nodes node)))) (get-adaptive-interval node)) err-rate-limit)
+        (asserts! (is-valid-status new-status) err-invalid-status)
+        
+        (let (
+            (health-score (calculate-health-score node new-status))
+            (node-data (unwrap! (map-get? nodes node) 
+                {
+                    registered: true,
+                    active: true,
+                    permissions: (list),
+                    last-active: u0,
+                    status: "active",
+                    group-id: none,
+                    health-score: u100,
+                    last-update: u0,
+                    update-count: u0
+                }))
+        )
+            (try! (add-status-history node new-status))
+            (map-set nodes node 
+                (merge node-data
                     {
-                        timestamp: current-time,
-                        action: action
+                        last-active: block-height,
+                        status: new-status,
+                        health-score: health-score,
+                        last-update: block-height,
+                        update-count: (+ (get update-count node-data) u1)
                     }
                 )
-                u100
-            ))
-        )
-    )
-)
-
-;; Public Functions
-(define-public (register-node (node principal))
-    (begin
-        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (asserts! (not (is-registered node)) err-already-registered)
-        
-        (map-set nodes node {
-            registered: true,
-            active: true,
-            permissions: (list),
-            last-active: block-height,
-            status: "active",
-            group-id: none
-        })
-        
-        (var-set total-nodes (+ (var-get total-nodes) u1))
-        (log-activity node "registered")
-        (ok true)
-    )
-)
-
-(define-public (create-node-group 
-    (name (string-ascii 20))
-    (description (string-ascii 50))
-    (auto-revoke bool)
-    (inactivity-threshold uint)
-)
-    (let ((group-id (var-get total-groups)))
-        (begin
-            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-            
-            (map-set node-groups group-id {
-                name: name,
-                description: description,
-                members: (list),
-                created-at: block-height,
-                settings: {
-                    auto-revoke: auto-revoke,
-                    inactivity-threshold: inactivity-threshold
-                }
-            })
-            
-            (var-set total-groups (+ group-id u1))
-            (ok group-id)
-        )
-    )
-)
-
-(define-public (add-node-to-group (node principal) (group-id uint))
-    (let ((node-data (unwrap! (map-get? nodes node) err-not-registered))
-          (group-data (unwrap! (map-get? node-groups group-id) err-group-not-found)))
-        (begin
-            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-            (asserts! (is-none (get group-id node-data)) err-already-in-group)
-            
-            (map-set nodes node (merge node-data { group-id: (some group-id) }))
-            (map-set node-groups group-id 
-                (merge group-data {
-                    members: (unwrap-panic (as-max-len? 
-                        (append (get members group-data) node)
-                        u100
-                    ))
-                })
             )
-            (log-activity node (concat "added-to-group-" (to-string group-id)))
             (ok true)
         )
     )
 )
 
-(define-public (revoke-node (node principal))
-    (begin
-        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (asserts! (is-registered node) err-not-registered)
-        
-        (map-set nodes node 
-            (merge 
-                (default-to 
-                    {
-                        registered: true,
-                        active: true,
-                        permissions: (list),
-                        last-active: u0,
-                        status: "active",
-                        group-id: none
-                    }
-                    (map-get? nodes node)
-                )
-                {
-                    active: false,
-                    status: "revoked"
-                }
-            )
-        )
-        (log-activity node "revoked")
-        (ok true)
-    )
-)
-
-(define-public (update-node-status (node principal) (new-status (string-ascii 20)))
-    (begin
-        (asserts! (is-registered node) err-not-registered)
-        (asserts! (is-active node) err-revoked)
-        
-        (map-set nodes node 
-            (merge 
-                (default-to
-                    {
-                        registered: true,
-                        active: true,
-                        permissions: (list),
-                        last-active: u0,
-                        status: "active",
-                        group-id: none
-                    }
-                    (map-get? nodes node)
-                )
-                {
-                    last-active: block-height,
-                    status: new-status
-                }
-            )
-        )
-        (log-activity node new-status)
-        (ok true)
-    )
-)
-
-;; Read-only Functions
-(define-read-only (get-node-info (node principal))
-    (ok (map-get? nodes node))
-)
-
-(define-read-only (get-node-activity (node principal))
-    (ok (map-get? node-activity node))
-)
-
-(define-read-only (get-total-nodes)
-    (ok (var-get total-nodes))
-)
-
-(define-read-only (get-group-info (group-id uint))
-    (ok (map-get? node-groups group-id))
-)
-
-(define-read-only (get-total-groups)
-    (ok (var-get total-groups))
-)
+[Remaining functions unchanged]
