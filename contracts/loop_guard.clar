@@ -10,16 +10,18 @@
 (define-constant err-already-in-group (err u105))
 (define-constant err-rate-limit (err u106))
 (define-constant err-invalid-status (err u107))
+(define-constant err-history-full (err u108))
 
 ;; Rate limiting constants
 (define-constant min-update-interval u10)
 (define-constant valid-statuses (list "active" "running" "stopped" "maintenance" "error"))
+(define-constant max-history-length u50)
 
 ;; Data Variables 
 (define-data-var total-nodes uint u0)
 (define-data-var total-groups uint u0)
 
-;; Data Maps
+;; Enhanced Data Maps
 (define-map nodes 
     principal 
     {
@@ -30,56 +32,63 @@
         status: (string-ascii 20),
         group-id: (optional uint),
         health-score: uint,
-        last-update: uint
+        last-update: uint,
+        update-count: uint
     }
 )
 
-;; Additional maps and existing ones...
-[Previous maps remain unchanged]
+;; New Status History Map
+(define-map status-history
+    principal
+    {
+        entries: (list 50 {
+            status: (string-ascii 20),
+            timestamp: uint,
+            blocks-in-status: uint
+        })
+    }
+)
 
 ;; Enhanced Private Functions
-(define-private (is-valid-status (status (string-ascii 20)))
-    (unwrap-panic (index-of valid-statuses status))
-)
-
-(define-private (can-update-status (node principal))
-    (let ((last-update (get last-update (default-to 
-        { last-update: u0 } 
-        (map-get? nodes node)))))
-        (> (- block-height last-update) min-update-interval)
-    )
-)
-
-(define-private (update-health-score (node principal) (status (string-ascii 20)))
-    (let ((current-score (get health-score (default-to 
-        { health-score: u100 } 
-        (map-get? nodes node)))))
-        (if (is-eq status "error")
-            (- current-score u10)
-            (min u100 (+ current-score u1))
+(define-private (get-adaptive-interval (node principal))
+    (let ((node-data (unwrap! (map-get? nodes node) u0)))
+        (if (< (get health-score node-data) u50)
+            (* min-update-interval u2)
+            min-update-interval
         )
     )
 )
 
-;; New Batch Operation Function
-(define-public (batch-update-status 
-    (nodes (list 10 principal)) 
-    (new-status (string-ascii 20)))
-    (begin
-        (asserts! (is-valid-status new-status) err-invalid-status)
-        (fold check-and-update nodes (ok true))
+(define-private (add-status-history (node principal) (new-status (string-ascii 20)))
+    (let (
+        (current-history (default-to { entries: (list) } (map-get? status-history node)))
+        (new-entry {
+            status: new-status,
+            timestamp: block-height,
+            blocks-in-status: u0
+        })
+    )
+        (if (>= (len (get entries current-history)) max-history-length)
+            (err err-history-full)
+            (ok (map-set status-history node {
+                entries: (append (get entries current-history) new-entry)
+            }))
+        )
     )
 )
 
-(define-private (check-and-update (node principal) (previous-result (response bool uint)))
-    (if (is-ok previous-result)
-        (begin
-            (asserts! (is-registered node) err-not-registered)
-            (asserts! (is-active node) err-revoked)
-            (asserts! (can-update-status node) err-rate-limit)
-            (update-node-status node new-status)
+(define-private (calculate-health-score (node principal) (status (string-ascii 20)))
+    (let (
+        (node-data (unwrap! (map-get? nodes node) u0))
+        (base-score (get health-score node-data))
+        (update-count (get update-count node-data))
+    )
+        (cond
+            ((is-eq status "error") (- base-score u10))
+            ((is-eq status "maintenance") (- base-score u5))
+            ((> update-count u100) (min u100 (+ base-score u2)))
+            (true (min u100 (+ base-score u1)))
         )
-        previous-result
     )
 )
 
@@ -88,34 +97,38 @@
     (begin
         (asserts! (is-registered node) err-not-registered)
         (asserts! (is-active node) err-revoked)
-        (asserts! (can-update-status node) err-rate-limit)
+        (asserts! (>= (- block-height (get last-update (default-to 
+            { last-update: u0 } 
+            (map-get? nodes node)))) (get-adaptive-interval node)) err-rate-limit)
         (asserts! (is-valid-status new-status) err-invalid-status)
         
-        (let ((health-score (update-health-score node new-status)))
+        (let (
+            (health-score (calculate-health-score node new-status))
+            (node-data (unwrap! (map-get? nodes node) 
+                {
+                    registered: true,
+                    active: true,
+                    permissions: (list),
+                    last-active: u0,
+                    status: "active",
+                    group-id: none,
+                    health-score: u100,
+                    last-update: u0,
+                    update-count: u0
+                }))
+        )
+            (try! (add-status-history node new-status))
             (map-set nodes node 
-                (merge 
-                    (default-to
-                        {
-                            registered: true,
-                            active: true,
-                            permissions: (list),
-                            last-active: u0,
-                            status: "active",
-                            group-id: none,
-                            health-score: u100,
-                            last-update: u0
-                        }
-                        (map-get? nodes node)
-                    )
+                (merge node-data
                     {
                         last-active: block-height,
                         status: new-status,
                         health-score: health-score,
-                        last-update: block-height
+                        last-update: block-height,
+                        update-count: (+ (get update-count node-data) u1)
                     }
                 )
             )
-            (log-activity node new-status)
             (ok true)
         )
     )
